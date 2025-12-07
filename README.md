@@ -4,11 +4,11 @@ A distributed system benchmarking Redis Streams and React rendering performance 
 
 ![Demo](./c-demo.png)
 
-## The "Why"
+## Problem
 
-Standard REST polling architectures introduce significant latency and UI lag when handling high-frequency data streams. Polling intervals create a trade-off between freshness and server load, while burst traffic can overwhelm client applications, causing render blocking and poor user experience.
+REST polling sucks for high-frequency data. You either poll too often and kill your server, or poll too slowly and get stale data. When traffic spikes, clients crash from render blocking.
 
-This system addresses these limitations by architecting a decoupled ingestion-to-display pipeline. The goal is to handle burst traffic without crashing the client, maintain sub-100ms end-to-end latency, and validate rendering performance under sustained load.
+This system decouples ingestion from display. Python generates trades at a constant rate, Redis buffers them, and WebSocket pushes to clients. The frontend batches updates to 60fps so the UI doesn't lag. Goal is sub-100ms end-to-end latency while handling 100k+ events/hour.
 
 ## Architecture
 
@@ -26,161 +26,136 @@ graph LR
     style E fill:#f59e0b,color:#fff
 ```
 
-## Key Technical Decisions
+## Design Decisions
 
-### Redis Streams as Backpressure Buffer
+### Redis Streams for Backpressure
 
-Redis Streams acts as a decoupling layer between the ingestion service and client applications. The Python ingestion service writes events via `XADD` at a constant rate (~27.78 events/second), while the WebSocket server consumes via blocking `XREAD` operations. This design provides:
+I use Redis Streams as a buffer between the Python ingestion service and clients. Python writes via `XADD` at ~27 events/second. The WebSocket server does blocking `XREAD` to consume.
 
-- **Backpressure handling**: If clients disconnect or process slowly, events accumulate in Redis rather than being lost
-- **Horizontal scaling**: Multiple WebSocket servers can read from the same stream using consumer groups
-- **Replay capability**: Historical events remain accessible for analysis or client reconnection scenarios
+Why this works:
+- If clients disconnect, events pile up in Redis instead of getting lost
+- Can scale horizontally with multiple WebSocket servers reading the same stream
+- Can replay history if a client reconnects
 
-**Trade-off**: Adds ~5-10ms latency per event, but prevents client crashes during traffic spikes.
+Trade-off: Adds ~5-10ms latency per event, but prevents client crashes during spikes.
 
-### RequestAnimationFrame Batching (Frontend)
+### requestAnimationFrame Batching
 
-The React application batches state updates using `requestAnimationFrame` to align with the browser's 60Hz refresh rate. Incoming WebSocket messages are queued in memory and processed once per frame, preventing:
+The React app queues WebSocket messages and processes them once per frame (60fps). This prevents DOM thrashing when events arrive faster than the browser can render.
 
-- DOM thrashing from rapid state updates
-- Main thread blocking during high-frequency bursts
-- Memory pressure from excessive re-renders
+Events come in at ~36ms intervals, but the UI updates at 60fps (16.67ms). This is where the "sub-100ms latency" claim comes from - the UI stays smooth even under load.
 
-This validates the "sub-100ms latency" claim: while events arrive at ~36ms intervals, the UI updates at 60fps (16.67ms intervals), ensuring smooth rendering without visual lag.
+Trade-off: You might see the latest event a frame late, but you get consistent 60fps.
 
-**Trade-off**: Slight delay in displaying the absolute latest event, but maintains consistent 60fps rendering performance.
+### Random Walk Price Generation
 
-### Synthetic Load Generation
-
-Market data is generated using a random-walk algorithm rather than static price variation. Each symbol maintains a `current_price` state that evolves via:
+Instead of random noise around a base price, I use a random walk. Each symbol tracks `current_price` and updates it like:
 
 ```
 new_price = previous_price * (1 + volatility_factor)
 ```
 
-where `volatility_factor` is sampled from `[-0.0005, +0.0005]` (±0.05% per event). This produces realistic trending behavior for load testing, as opposed to flat noise around a base price.
-
-**Rationale**: Enables reproducible load testing scenarios and validates chart rendering performance under realistic market conditions.
+where `volatility_factor` is `[-0.0005, +0.0005]` (±0.05% per event). This creates realistic trends for load testing, not just flat noise.
 
 ## Tech Stack
 
-### Backend
-- **Runtime**: Python 3.11
-- **Framework**: FastAPI 0.104+
-- **Concurrency**: asyncio with async/await patterns
-- **Containerization**: Docker with Python 3.11-slim base image
+**Backend:**
+- Python 3.11
+- FastAPI 0.104+
+- asyncio
+- Docker (Python 3.11-slim)
 
-### Data Layer
-- **Streaming**: Redis 7 with Streams data structure
-- **Protocol**: Redis Streams (XADD/XREAD operations)
-- **Persistence**: AOF (append-only file) enabled
+**Data:**
+- Redis 7 (Streams)
+- XADD/XREAD operations
+- AOF persistence
 
-### Web Client
-- **Framework**: Next.js 14 (App Router)
-- **Language**: TypeScript 5.3+
-- **Styling**: Tailwind CSS 3.3+ with custom Bloomberg terminal theme
-- **Animations**: Framer Motion 10.16+ for price change indicators
-- **State Management**: React hooks with requestAnimationFrame batching
+**Web:**
+- Next.js 14 (App Router)
+- TypeScript 5.3+
+- Tailwind CSS 3.3+ (Bloomberg terminal theme)
+- Framer Motion 10.16+
+- React hooks with requestAnimationFrame batching
 
-### Mobile Client
-- **Language**: Swift 5
-- **UI Framework**: SwiftUI
-- **Charts**: Swift Charts (iOS 16+)
-- **Reactive**: Combine framework for WebSocket message handling
-- **Network**: URLSessionWebSocketTask for native WebSocket support
+**Mobile:**
+- Swift 5
+- SwiftUI
+- Swift Charts (iOS 16+)
+- Combine
+- URLSessionWebSocketTask
 
 ## Quick Start
 
-### Prerequisites
-- Docker Desktop (for backend services)
-- Node.js 18+ and npm (for web dashboard)
-- Xcode 14+ with iOS 16+ SDK (for mobile app)
+**Prerequisites:** Docker Desktop, Node.js 18+, Xcode 14+ with iOS 16+ SDK
 
-### Step 1: Start Backend Services
-
+**Backend:**
 ```bash
 docker-compose up --build
 ```
 
-This starts:
-- Redis server on port `6379`
-- FastAPI backend on port `8000` with WebSocket endpoint at `/ws`
+Starts Redis on `6379` and FastAPI on `8000`. WebSocket endpoint is `/ws`.
 
-Verify health:
+Check it's working:
 ```bash
 curl http://localhost:8000/health
 ```
 
-### Step 2: Start Web Dashboard
-
+**Web Dashboard:**
 ```bash
 cd web-dashboard
 npm install
 npm run dev
 ```
 
-Dashboard available at `http://localhost:3000`
+Runs at `http://localhost:3000`
 
-### Step 3: Open iOS Project
-
+**iOS:**
 ```bash
 open ios-tracker/CryptoTracker.xcodeproj
 ```
 
-Build and run on simulator or device. **Note**: Update WebSocket URL in `WebSocketManager.swift` to use your machine's IP address instead of `localhost` for physical devices.
+Build and run. For physical devices, update the WebSocket URL in `WebSocketManager.swift` to use your machine's IP instead of `localhost`.
 
-## Performance Metrics
+## Performance
 
-- **Ingestion Rate**: 100,000+ events/hour (~27.78 events/second)
-- **End-to-End Latency**: < 50ms (ingestion → Redis → WebSocket → client render)
-- **Frontend Update Rate**: 60fps (batched via requestAnimationFrame)
-- **Memory Usage**: Bounded (100 trades web, 50 points iOS)
-- **Backend CPU**: < 5% under full load (Python asyncio efficiency)
+- **Ingestion:** 100,000+ events/hour (~27.78 events/second)
+- **Latency:** < 50ms end-to-end (ingestion → Redis → WebSocket → render)
+- **Frontend:** 60fps (batched via requestAnimationFrame)
+- **Memory:** Bounded (100 trades web, 50 points iOS)
+- **Backend CPU:** < 5% under full load
 
 ## Project Structure
 
 ```
 high-freq-crypto-platform/
-├── backend-engine/          # Python FastAPI service
+├── backend-engine/          # Python FastAPI
 │   ├── app/
-│   │   ├── main.py          # FastAPI app, WebSocket endpoint, lifespan events
-│   │   ├── models.py        # Pydantic data models
+│   │   ├── main.py          # FastAPI app, WebSocket, lifespan
+│   │   ├── models.py        # Pydantic models
 │   │   └── services/
-│   │       └── ingestion.py # Random-walk price generation, Redis XADD
+│   │       └── ingestion.py # Random-walk prices, Redis XADD
 │   ├── Dockerfile
 │   └── requirements.txt
-├── web-dashboard/           # Next.js TypeScript app
-│   ├── app/                 # App Router pages
-│   ├── components/          # React components (OrderBook with RAF batching)
+├── web-dashboard/           # Next.js
+│   ├── app/                 # App Router
+│   ├── components/          # OrderBook with RAF batching
 │   ├── package.json
-│   └── tailwind.config.js   # Bloomberg terminal color palette
-├── ios-tracker/             # SwiftUI iOS app
+│   └── tailwind.config.js   # Bloomberg colors
+├── ios-tracker/             # SwiftUI
 │   ├── CryptoTrackerApp.swift
 │   ├── ContentView.swift
 │   ├── Charts/PriceChart.swift
 │   └── Services/WebSocketManager.swift
-└── docker-compose.yml       # Service orchestration
+└── docker-compose.yml
 ```
 
-## Future Improvements
+## Future Work
 
-### Sharding Redis Streams by Symbol
-Currently, all symbols write to a single `trades:stream`. Sharding by symbol (e.g., `trades:BTC/USD`, `trades:ETH/USD`) would:
-- Enable parallel consumption across WebSocket servers
-- Reduce contention during high-load scenarios
-- Allow per-symbol retention policies
+**Sharding by Symbol:** Right now everything goes to one `trades:stream`. Sharding (e.g., `trades:BTC/USD`, `trades:ETH/USD`) would let WebSocket servers consume in parallel and reduce contention.
 
-### TimescaleDB for Historical Persistence
-Redis Streams are optimized for recent data (current implementation caps at 10,000 entries). Adding TimescaleDB would:
-- Provide long-term storage for backtesting and analysis
-- Enable time-series queries (OHLCV aggregation, moving averages)
-- Support historical replay for client initialization
+**TimescaleDB:** Redis Streams cap at 10k entries. Adding TimescaleDB would give long-term storage for backtesting, OHLCV queries, and historical replay.
 
-### Consumer Groups for Horizontal Scaling
-Implement Redis Streams consumer groups to enable:
-- Multiple WebSocket server instances reading from the same stream
-- Automatic load balancing across consumers
-- Failure recovery (unprocessed messages reassigned to healthy consumers)
+**Consumer Groups:** Would enable multiple WebSocket servers reading the same stream with automatic load balancing and failure recovery.
 
 ## License
 
