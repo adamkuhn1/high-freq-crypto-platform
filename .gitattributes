@@ -1,0 +1,6 @@
+*.swift linguist-detectable=false
+
+# Force other files to be detected correctly if needed
+*.py linguist-detectable=true
+*.ts linguist-detectable=true
+*.js linguist-detectable=true
